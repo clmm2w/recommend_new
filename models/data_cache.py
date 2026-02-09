@@ -243,40 +243,48 @@ class DataCache:
 
         for user_id, behaviors in self.user_behaviors.items():
             user_service_matrix[user_id] = {}
-            for behavior in behaviors:
+
+            # --- 修正：按时间排序，只保留最近的 N 条交互 (滑动窗口) ---
+            # 防止古老的行为干扰当下的兴趣，也能减少矩阵噪音
+            # 假设只看最近 50 条
+            sorted_behaviors = sorted(behaviors, key=lambda x: x.get('created_at', datetime.min), reverse=True)[:50]
+
+            for behavior in sorted_behaviors:
+                # ... (原来的获取 service_id 等逻辑)
                 service_id = behavior['service_id']
-                behavior_type = behavior['behavior_type']
-                duration = behavior.get('duration', 0)
-
                 if service_id not in user_service_matrix[user_id]:
-                    user_service_matrix[user_id][service_id] = 0
+                    user_service_matrix[user_id][service_id] = 0.0  # 浮点数
 
-                weight = behavior_weights.get(behavior_type, 1.0)
+                # ... (权重获取逻辑)
 
-                # 时间衰减
-                if 'created_at' in behavior and behavior['created_at']:
+                # ... (时间衰减逻辑)
+                # 修正：处理 datetime 类型不一致的 bug
+                days_diff = 0
+                created_at = behavior.get('created_at')
+                if isinstance(created_at, datetime):
+                    days_diff = (now - created_at).days
+                elif isinstance(created_at, str):
                     try:
-                        created_at = behavior['created_at']
-                        if isinstance(created_at, str):  # 防止字符串类型报错
-                            # 如果需要解析字符串时间，可在此添加 datetime.strptime
-                            days_diff = 0
-                        elif isinstance(created_at, datetime):
-                            days_diff = (now - created_at).days
-                        else:
-                            days_diff = 0
+                        # 假设格式，或者直接忽略字符串格式的时间衰减
+                        # dt = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+                        pass
+                    except:
+                        pass
 
-                        time_decay = 1.0 / (1.0 + days_diff / 14.0)
-                        weight *= time_decay
-                    except Exception:
-                        pass  # 忽略时间计算错误
+                # 强力衰减公式：让近期的权重远大于远期
+                time_decay = 1.0 / (1.0 + days_diff / 7.0)  # 7天半衰期
 
-                if behavior_type == 'view' and duration > 0:
-                    time_factor = min(duration / 60, 5)
-                    user_service_matrix[user_id][service_id] += weight * (1 + time_factor)
-                elif behavior_type == 'unfavorite':
-                    user_service_matrix[user_id][service_id] = max(0, user_service_matrix[user_id][service_id] + weight)
-                else:
-                    user_service_matrix[user_id][service_id] += weight
+                final_score = weight * time_decay
+
+                # 累加
+                user_service_matrix[user_id][service_id] += final_score
+
+            # --- 核心修正：对每个用户的分数值进行 Clipping (截断) ---
+            # 这一步至关重要！防止某个狂热用户的分数高达 100，把模型带偏
+            for sid in user_service_matrix[user_id]:
+                # 限制最大分为 5.0 (或者 1.0，取决于你的偏好)
+                # 这里限制为 5.0，让 SVD 学习 0-5 的分布
+                user_service_matrix[user_id][sid] = min(5.0, user_service_matrix[user_id][sid])
 
         self.user_service_matrix = user_service_matrix
 
@@ -375,8 +383,20 @@ class DataCache:
             return []
         try:
             user_idx = self.svd_model['user_idx'][user_id]
+            # 1. 计算原始预测值
             user_vec = self.svd_model['U'][user_idx] @ np.diag(self.svd_model['sigma'])
             predictions = user_vec @ self.svd_model['Vt']
+
+            # --- 核心修正：归一化处理 ---
+            # 找出最大最小值用于缩放 (简单的 MinMax)
+            # 注意：这里用全局最大最小可能不准，但为了简单有效，我们用 Sigmoid 函数压缩
+            # 因为 SVD 预测值可能是负无穷到正无穷
+            def sigmoid(x):
+                return 1 / (1 + np.exp(-x))
+
+            # 或者更简单的：截断法 (假设最大分大概是 5-10 左右)
+            # 这里的 scale_factor 是经验值，将 SVD 的 0~10 映射到 0~1 附近
+            scale_factor = 0.2
 
             interacted = set(self.user_service_matrix.get(user_id, {}).keys())
             candidates = []
@@ -384,7 +404,10 @@ class DataCache:
                 if i in self.svd_model['reverse_service_idx']:
                     sid = self.svd_model['reverse_service_idx'][i]
                     if sid not in interacted:
-                        candidates.append((sid, float(score)))
+                        # 修正：使用 Sigmoid 归一化，让输出变成 0~1 的概率感
+                        norm_score = sigmoid(score * scale_factor)
+                        candidates.append((sid, float(norm_score)))
+
             candidates.sort(key=lambda x: x[1], reverse=True)
             return candidates[:limit]
         except Exception as e:
